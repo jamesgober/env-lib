@@ -1,0 +1,31 @@
+# Normalize line endings across platforms.
+# Without this, Git's autocrlf on Windows checkouts converts LF -> CRLF, which
+# breaks `cargo fmt --check` because rustfmt.toml pins newline_style = "Unix".
+
+* text=auto eol=lf
+
+# Source and config — always LF.
+*.rs       text eol=lf
+*.toml     text eol=lf
+*.md       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.json     text eol=lf
+*.lock     text eol=lf
+
+# Shell and scripts.
+*.sh       text eol=lf
+
+# Batch / PowerShell stay CRLF on Windows tooling.
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+*.ps1      text eol=crlf
+
+# Binary blobs — leave Git alone.
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.svg      text eol=lf
+*.pdf      binary
