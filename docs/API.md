@@ -18,7 +18,7 @@
 </div>
 <br>
 
-> **Status:** This reference tracks the public surface of `env-lib` **1.0.0**. Everything documented here is frozen for 1.x under the [stability contract](./STABILITY-1.0.md).
+> **Status:** This reference tracks the public surface of `env-lib` **1.0.1**. Everything documented here is frozen for 1.x under the [stability contract](./STABILITY-1.0.md).
 
 ## Table of Contents
 
