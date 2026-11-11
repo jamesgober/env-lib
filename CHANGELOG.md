@@ -11,6 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.1] - 2026-10-26
+
+### Fixed
+
+- The documentation builds on docs.rs again. The crate root asked nightly
+  rustdoc for the `doc_auto_cfg` feature, which nightly has since folded
+  into `doc_cfg` and removed, so the docs.rs build of 1.0.0 failed
+  (`E0557`). It now asks for `doc_cfg`. No code change.
+
+---
+
 ## [1.0.0] - 2026-10-13
 
 Initial stable release. The public API is frozen for 1.x under
@@ -66,5 +77,6 @@ Initial stable release. The public API is frozen for 1.x under
 - Unit, integration, and property tests; criterion benchmarks; CI for
   Linux, macOS, and Windows on stable and MSRV 1.85.
 
-[Unreleased]: https://github.com/jamesgober/env-lib/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/env-lib/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/jamesgober/env-lib/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/env-lib/releases/tag/v1.0.0
