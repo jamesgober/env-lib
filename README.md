@@ -60,7 +60,8 @@
 
 ### Secrets
 - **Never printed** &mdash; `Debug` lists names only; errors name the variable, file, and line, never the value
-- **Owner-only files** &mdash; a newly created file is `0600` on Unix; an existing file keeps its permissions
+- **Owner-only files** &mdash; a new file is private from the first byte: `0600` on Unix, a protected access control list on Windows, also under `%ProgramData%`
+- **Checked before trusted** &mdash; a file other accounts can change, a file another account owns, and a FIFO or device are refused, never read
 - **Atomic writes** &mdash; readers see the old file or the complete new one, never a partial write
 
 <hr>
@@ -69,10 +70,10 @@
 
 ```toml
 [dependencies]
-env-lib = "1.0"
+env-lib = "1.1"
 ```
 
-`Env::for_app` takes a `path_lib::App`. To use it, add `path-lib = "1.0"` as well; `env-lib` already depends on it, so no additional code is compiled.
+`Env::for_app` takes a `path_lib::App`. To use it, add `path-lib = "1.3"` as well; `env-lib` already depends on it, so no additional code is compiled.
 
 <hr>
 
@@ -83,7 +84,8 @@ use env_lib::Env;
 
 // The file is ~/.config/HiveDB/.env on Linux, %APPDATA%\HiveDB\.env on Windows.
 let app = path_lib::App::new("HiveDB")?;
-let mut env = Env::for_app(&app)?;            // a missing file is an empty Env
+let mut env = Env::for_app(&app)?             // a missing file is an empty Env
+    .with_prefix("HIVE_")?;                   // exported as HIVE_PORT, not the shared JG_PORT
 
 env.set("PORT", "7000")?;
 env.set("DB_URL", "postgres://localhost/hive")?;
@@ -91,7 +93,7 @@ env.remove("LEGACY_MODE");
 env.save()?;                                  // comments and hand edits are kept
 
 // Next run, or after someone edits the file by hand:
-let env = Env::for_app(&app)?;
+let env = Env::for_app(&app)?.with_prefix("HIVE_")?;
 let port: u16 = env.parse("PORT")?.unwrap_or(8080);
 let debug = env.flag("DEBUG")?.unwrap_or(false);
 let level = env.get_or("LOG_LEVEL", "info");

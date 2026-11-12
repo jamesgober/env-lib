@@ -18,7 +18,7 @@
 </div>
 <br>
 
-> **Status:** This reference tracks the public surface of `env-lib` **1.0.1**. Everything documented here is frozen for 1.x under the [stability contract](./STABILITY-1.0.md).
+> **Status:** This reference tracks the public surface of `env-lib` **1.1.0**. Everything documented here is frozen for 1.x under the [stability contract](./STABILITY-1.0.md).
 
 ## Table of Contents
 
@@ -54,8 +54,9 @@
 | Function | File | Fails when |
 |---|---|---|
 | `Env::new()` | None | Never |
-| `Env::open(path)` | `path` | The file exists but is malformed, too large, or unreadable |
-| `Env::for_app(&app)` | `.env` in the app's config directory | As for `open` |
+| `Env::open(path)` | `path` | The file exists but is malformed, too large, unreadable, not a regular file, or fails the [file check](#file-checks) |
+| `Env::open_unchecked(path)` | `path` | As for `open`, without the owner and permission check (since 1.1) |
+| `Env::for_app(&app)` | `.env` in the app's config directory | As for `open`; for a global `App`, also when other accounts can read the file |
 | `Env::from_text(text)` | None | The text is malformed |
 
 ```rust
@@ -113,9 +114,9 @@ assert!(env_lib::Env::new().with_prefix("JG.").is_err());
 | `with_prefix(self, prefix)` | Sets the prefix; returns the `Env` for chaining |
 | `prefix()` | The current prefix, `JG_` unless changed |
 
-The default prefix is `DEFAULT_PREFIX`, `"JG_"`. An empty prefix means the default. Any other prefix must itself be a valid name, or `with_prefix` fails with `Error::InvalidPrefix`; `JG.` is rejected because a dot cannot appear in a shell variable name. The prefix is joined to the name as written, so include the separator: `HIVE_` gives `HIVE_PORT`, while `HIVE` gives `HIVEPORT`.
+The default prefix is `DEFAULT_PREFIX`, `"JG_"`. An empty prefix means the default. Any other prefix must itself be a valid name, or `with_prefix` fails with `Error::InvalidPrefix`; `JG.` is rejected because a dot cannot appear in a shell variable name. The prefix is joined to the name as written, so include the separator: `HIVE_` gives `HIVE_PORT`, while `HIVE` gives `HIVEPORT`. Every program that keeps the default shares the `JG_` namespace with every other one, so set a prefix of your own.
 
-Every method that takes a name accepts it with or without the prefix: with the prefix `JG_`, both `PORT` and `JG_PORT` address the variable `PORT`. A name equal to the prefix alone (`JG_`) is a name of its own. Write names in the file without the prefix; the prefix is removed from names passed to methods, not from names read from the file.
+With a prefix that ends in `_`, every method that takes a name accepts it with or without the prefix: with the prefix `JG_`, both `PORT` and `JG_PORT` address the variable `PORT`. A name equal to the prefix alone (`JG_`) is a name of its own. Since 1.1 this also holds for names written with the prefix in the file: `JG_TOKEN=abc` is found by `get("JG_TOKEN")` and by `get("TOKEN")`, and is exported once, as `JG_TOKEN`. A prefix without the trailing `_` (`HIVE`) is still added on export, but names are never stripped of it, so with the prefix `APP` the name `APPLE` stays `APPLE` (before 1.1 it became `LE`).
 
 ### Reading
 
@@ -215,7 +216,18 @@ assert!(!env.contains("UNSAVED"));
 
 If the file was deleted after it was loaded, the save recreates it with only this session's changes. Variables that are no longer in the file after a save, because they were deleted by hand, are removed from the target environment by the next `apply_to` or `export`, as after `reload`. If the file on disk has become malformed, the save fails with `Error::Syntax` and writes nothing; the `Env` keeps its changes, so fix the file and save again.
 
-The save writes the whole file through `path_lib::write_atomic`, so a reader sees either the old file or the complete new one, never a partial write. Missing directories are created. On Unix a newly created file is given mode `0600` before anything is written to it, since `.env` files often hold secrets; an existing file keeps its permissions. On Windows the file inherits the directory's access control list, and the per-user config directory is already private to the user. A failed save leaves the existing file untouched.
+The save writes the whole file atomically, so a reader sees either the old file or the complete new one, never a partial write. A new file is private to the current user from the first byte, since `.env` files often hold secrets: mode `0600` on Unix, and on Windows a protected access control list for the current user, `SYSTEM`, and `Administrators`, also under `%ProgramData%` (`path_lib::write_atomic_private`, since 1.1; before, Windows files inherited the directory's list, which under `%ProgramData%` every local user can read). Missing directories are created private as well. An existing private file stays private; an existing file that is not private keeps its Unix permissions (on Windows it inherits the directory's list). For `for_app`, the config directory is created through `App::ensure`, which also checks it if it already exists. A failed save leaves the existing file untouched.
+
+### File checks
+
+Since 1.1, every read of the file (`open`, `for_app`, `reload`, and the re-read at the start of `save`) checks it first, on the open file that is then read:
+
+- It must be a regular file. A directory, FIFO, socket, or device fails with `Error::Io`; on Unix the file is opened without blocking, so a FIFO planted in its place cannot hang the program.
+- It must be owned by the current user or an administrator account (root on Unix; `SYSTEM` or `Administrators` on Windows), and no other account may be able to change it: no group or other write bit on Unix, no write right for another account in its access control list on Windows. Otherwise the error is `Error::Path(path_lib::Error::Refused { reason, .. })`, and `reason` says what to fix.
+- For `for_app` on a global `App` (a machine-wide service), other accounts may not read it either.
+- A symbolic link at the path is followed only when the directory holding it passes the same owner check, so another user cannot have planted it.
+
+`open_unchecked` skips the owner and permission check (it still requires a regular file), for development setups such as a project `.env` in a checkout that other accounts can write. Never use it for a file a service trusts.
 
 `save_to(path)` with the `Env`'s own file is the same as `save`. With any other path, every variable the `Env` holds is written into that file and variables removed this session are removed from it; the file's other variables, comments, and layout are kept. The `Env` is then tied to `path`, so later calls to `save` and `reload` use it, and it holds the merged set, including the variables that were already in that file.
 

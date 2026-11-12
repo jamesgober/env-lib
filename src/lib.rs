@@ -33,11 +33,22 @@
 //! [`path_lib`], for example `~/.config/<app>/.env` on Linux or
 //! `%APPDATA%\<app>\.env` on Windows.
 //!
+//! Before a file is read it is checked: it must be a regular file owned
+//! by the current user or an administrator account, and no other account
+//! may be able to change it. A machine-wide application
+//! ([`path_lib::App::global`]) also needs it unreadable by other accounts.
+//! A file that fails is refused with the reason, never read. For a
+//! development checkout that cannot pass, use [`Env::open_unchecked`].
+//!
 //! # Names and the prefix
 //!
 //! Names are plain in code and in the file (`PORT`). Only the copies placed
 //! in a process environment carry the prefix (`JG_PORT` by default; change
 //! it with [`Env::with_prefix`], and an empty prefix falls back to `JG_`).
+//! Every program that keeps the default shares the `JG_` namespace, so a
+//! program should set a prefix of its own (`HIVE_`), ending in `_`. A name
+//! written with the prefix in the file (`JG_TOKEN=...`) is the same
+//! variable as the plain one.
 //! [`Env::get`] looks in the `Env` first and then in the process
 //! environment under the prefixed name, so a value exported earlier or set
 //! by a parent process is found too.
@@ -65,7 +76,11 @@
 //! # Secrets
 //!
 //! Values never appear in `Debug` output or in errors. New files are
-//! created owner-only (`0600`) on Unix, and saves are atomic.
+//! private to the owner from the first byte: mode `0600` on Unix, and on
+//! Windows a protected access control list for the current user, `SYSTEM`,
+//! and `Administrators`, also under `%ProgramData%`. Saves are atomic.
+//! Values are held in ordinary `String`s: they are not wiped from memory
+//! when dropped, and cloning an `Env` copies them.
 
 #![deny(warnings)]
 #![deny(missing_docs)]

@@ -1,7 +1,7 @@
 //! [`Env`]: an application's own environment variables.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -14,6 +14,11 @@ use crate::error::{Error, Result};
 use crate::key::{self, DEFAULT_PREFIX};
 
 /// Largest `.env` file that will be read, in bytes.
+///
+/// It bounds the input, and with it the memory a parse needs: one owned
+/// copy of each run of comment and blank lines, and about 300 bytes plus
+/// the text for each entry. A file at the limit made only of very short
+/// entries (about 130,000 of them) takes about 40 MiB while it is loaded.
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// The name [`Env::for_app`] gives the file in an application's config
@@ -41,7 +46,13 @@ pub const FILE_NAME: &str = ".env";
 ///   program ran, comments, blank lines, and ordering, is kept as written.
 ///   When the file and the program changed the same variable, the
 ///   program's value wins. The write is atomic.
-/// - **Values** never appear in `Debug` output or in errors.
+/// - **Values** never appear in `Debug` output or in errors. They are
+///   held in ordinary `String`s, so they are not wiped from memory when
+///   dropped, and cloning an `Env` copies them.
+/// - **Files** are checked before they are read: a file other accounts
+///   can change, a file owned by another account, and anything that is
+///   not a regular file (a FIFO, a device) are refused. See
+///   [`open`](Env::open).
 ///
 /// [prefix]: Env::prefix
 ///
@@ -67,19 +78,41 @@ pub const FILE_NAME: &str = ".env";
 #[derive(Clone)]
 pub struct Env {
     file: Option<PathBuf>,
+    /// How the file is checked before it is read.
+    check: Check,
+    /// The application, when the file is its config `.env`, so a save can
+    /// create and check the config directory through it.
+    app: Option<path_lib::App>,
     prefix: String,
     values: HashMap<String, String>,
     /// Keys in first-appearance order, for iteration and for appending
-    /// new entries on save.
+    /// new entries on save. After a removal, a removed key stays here
+    /// until the next compaction, and only the position `index` names is
+    /// live.
     order: Vec<String>,
+    /// The live position in `order` of every key held, built on the first
+    /// removal (until then every position is live), so removing a key
+    /// costs no scan of `order` and loading a file pays nothing for it.
+    index: Option<HashMap<String, usize>>,
     /// The file as last loaded or saved, for lossless rewrites.
     doc: Document,
     /// Keys set or removed since the last load or save, in order. A save
     /// applies exactly these to the file as it is on disk at that moment.
     changed: Vec<String>,
+    /// The same keys, for constant-time membership tests.
+    touched: HashSet<String>,
     /// Keys removed since the last export, so `export` and `apply_to` can
     /// clear them from the target environment.
-    removed: Vec<String>,
+    removed: BTreeSet<String>,
+}
+
+/// What a file must pass before it is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// Only that it is a regular file ([`Env::open_unchecked`]).
+    RegularFile,
+    /// [`path_lib::check_owner`] with this level, on the open handle.
+    Owner(path_lib::Others),
 }
 
 impl Env {
@@ -89,12 +122,16 @@ impl Env {
     pub fn new() -> Self {
         Self {
             file: None,
+            check: Check::Owner(path_lib::Others::MayRead),
+            app: None,
             prefix: DEFAULT_PREFIX.to_owned(),
             values: HashMap::new(),
             order: Vec::new(),
+            index: None,
             doc: Document::default(),
             changed: Vec::new(),
-            removed: Vec::new(),
+            touched: HashSet::new(),
+            removed: BTreeSet::new(),
         }
     }
 
@@ -106,18 +143,56 @@ impl Env {
     /// When a variable appears more than once in the file, the last value
     /// wins (and a save keeps only that line).
     ///
+    /// The file is checked before it is read, every time it is read
+    /// (here, in [`reload`](Env::reload), and in [`save`](Env::save)): it
+    /// must be a regular file, owned by the current user or an
+    /// administrator account (root; `SYSTEM` or `Administrators`), and no
+    /// other account may be able to change it (no group or other write bit
+    /// on Unix, no write right for another account in its access control
+    /// list on Windows). The check is made on the open file, which is then
+    /// the file read, and on Unix the file is opened without blocking, so a
+    /// FIFO planted in its place is refused instead of hanging the
+    /// program. A symbolic link at `path` is followed only when the
+    /// directory holding it passes the same check, so nobody else could
+    /// have planted it. Use [`open_unchecked`](Env::open_unchecked) for a
+    /// development setup that cannot pass, such as a checkout on a shared
+    /// Windows drive.
+    ///
     /// # Errors
     ///
     /// - [`Error::Syntax`] with the line number for a malformed line.
     /// - [`Error::TooLarge`] beyond [`MAX_FILE_BYTES`].
-    /// - [`Error::Io`] if the file exists but cannot be read.
+    /// - [`Error::Path`] with [`path_lib::Error::Refused`] if the file, or
+    ///   the directory holding a link to it, fails the check; the reason
+    ///   says what to fix.
+    /// - [`Error::Io`] if the file exists but cannot be read, or is not a
+    ///   regular file.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = expand(path.as_ref())?;
+        Self::open_with(path.as_ref(), Check::Owner(path_lib::Others::MayRead), None)
+    }
+
+    /// Like [`open`](Env::open), but without the owner and permission
+    /// check: the file only has to be a regular file. For development
+    /// setups only, such as a project `.env` in a checkout that other
+    /// accounts can write to; never for a file a service trusts.
+    ///
+    /// # Errors
+    ///
+    /// As for [`open`](Env::open), except that the file is not refused for
+    /// its owner or permissions.
+    pub fn open_unchecked(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path.as_ref(), Check::RegularFile, None)
+    }
+
+    fn open_with(path: &Path, check: Check, app: Option<path_lib::App>) -> Result<Self> {
+        let path = expand(path)?;
         let mut env = Self::new();
-        if let Some(text) = read_file(&path)? {
+        env.check = check;
+        if let Some(text) = read_file(&path, check)? {
             env.load_document(dotenv::parse(&text, Some(&path))?);
         }
         env.file = Some(path);
+        env.app = app;
         Ok(env)
     }
 
@@ -125,9 +200,21 @@ impl Env {
     /// resolved by `path-lib` (for example
     /// `~/.config/HiveDB/.env` on Linux).
     ///
+    /// The file is checked as by [`open`](Env::open). For an application
+    /// in [`Scope::Global`](path_lib::Scope::Global), a machine-wide
+    /// service, the file must also be unreadable by other accounts, since
+    /// it holds the service's secrets. A save creates the config directory
+    /// with [`App::ensure`](path_lib::App::ensure), which checks it if it
+    /// already exists, and writes a new file private to the current user:
+    /// mode `0600` on Unix, and on Windows a protected access control list
+    /// for the current user, `SYSTEM`, and `Administrators`, even under
+    /// `%ProgramData%`.
+    ///
     /// # Errors
     ///
-    /// As for [`open`](Env::open).
+    /// As for [`open`](Env::open); also [`Error::Path`] with
+    /// [`path_lib::Error::Refused`] when a global application's file is
+    /// readable by other accounts.
     ///
     /// # Examples
     ///
@@ -137,7 +224,16 @@ impl Env {
     /// # Ok::<(), env_lib::Error>(())
     /// ```
     pub fn for_app(app: &path_lib::App) -> Result<Self> {
-        Self::open(app.config_at(FILE_NAME)?)
+        let others = if app.scope() == path_lib::Scope::Global {
+            path_lib::Others::NoAccess
+        } else {
+            path_lib::Others::MayRead
+        };
+        Self::open_with(
+            &app.config_at(FILE_NAME)?,
+            Check::Owner(others),
+            Some(app.clone()),
+        )
     }
 
     /// Parses `.env` text without tying the result to a file.
@@ -161,7 +257,14 @@ impl Env {
 
     /// Sets the prefix used when exporting to, and reading from, the
     /// process environment. An empty prefix means [`DEFAULT_PREFIX`]
-    /// (`JG_`).
+    /// (`JG_`). Programs that are not part of one family of tools should
+    /// set their own, so they do not read each other's `JG_` variables.
+    ///
+    /// End the prefix with `_` (`HIVE_`). Only then is a prefixed name
+    /// (`HIVE_PORT`) treated as the same variable as the plain one
+    /// (`PORT`). A prefix without the separator (`HIVE`) is still added
+    /// on export (`HIVEPORT`), but names are never stripped of it, so
+    /// `APPLE` stays `APPLE` under the prefix `APP`.
     ///
     /// # Errors
     ///
@@ -200,10 +303,10 @@ impl Env {
     /// Unicode, or if `key` is not a valid name.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<Cow<'_, str>> {
-        let key = self.unprefixed(key);
-        if let Some(value) = self.values.get(key) {
-            return Some(Cow::Borrowed(value));
+        if let Some(stored) = self.stored_key(key) {
+            return self.values.get(stored).map(|v| Cow::Borrowed(v.as_str()));
         }
+        let key = self.unprefixed(key);
         if key::check_name(key).is_err() {
             return None;
         }
@@ -303,11 +406,14 @@ impl Env {
     /// [`Error::InvalidKey`] or [`Error::InvalidValue`] (NUL, or more than
     /// [`MAX_VALUE_BYTES`](crate::MAX_VALUE_BYTES)).
     pub fn set(&mut self, key: &str, value: impl Into<String>) -> Result<()> {
-        let key = self.unprefixed(key).to_owned();
+        let key = match self.stored_key(key) {
+            Some(stored) => stored.to_owned(),
+            None => self.unprefixed(key).to_owned(),
+        };
         let value = value.into();
         key::check_key(&key)?;
         key::check_value(&key, &value)?;
-        self.removed.retain(|k| *k != key);
+        let _was_removed = self.removed.remove(&key);
         match self.values.get_mut(&key) {
             Some(current) if *current == value => {}
             Some(current) => {
@@ -316,8 +422,12 @@ impl Env {
             }
             None => {
                 self.touch(&key);
+                if let Some(index) = &mut self.index {
+                    let _previous = index.insert(key.clone(), self.order.len());
+                }
                 self.order.push(key.clone());
                 let _previous = self.values.insert(key, value);
+                self.compact_if_sparse();
             }
         }
         Ok(())
@@ -327,13 +437,14 @@ impl Env {
     /// The next save drops it from the file, and the next export removes
     /// it from the target environment.
     pub fn remove(&mut self, key: &str) -> bool {
-        let key = self.unprefixed(key);
-        if self.values.remove(key).is_none() {
+        let Some(key) = self.stored_key(key).map(str::to_owned) else {
             return false;
-        }
-        self.order.retain(|k| k != key);
-        self.removed.push(key.to_owned());
-        self.touch(key);
+        };
+        let _value = self.values.remove(&key);
+        let _position = self.index_mut().remove(&key);
+        self.touch(&key);
+        let _new = self.removed.insert(key);
+        self.compact_if_sparse();
         true
     }
 
@@ -341,10 +452,12 @@ impl Env {
     /// comments and blank lines, and the next export removes them all from
     /// the target environment.
     pub fn clear(&mut self) {
+        self.index = None;
         for key in std::mem::take(&mut self.order) {
-            let _value = self.values.remove(&key);
-            self.touch(&key);
-            self.removed.push(key);
+            if self.values.remove(&key).is_some() {
+                self.touch(&key);
+                let _new = self.removed.insert(key);
+            }
         }
     }
 
@@ -352,7 +465,7 @@ impl Env {
     /// not consulted).
     #[must_use]
     pub fn contains(&self, key: &str) -> bool {
-        self.values.contains_key(self.unprefixed(key))
+        self.stored_key(key).is_some()
     }
 
     /// Number of variables this `Env` holds.
@@ -372,7 +485,13 @@ impl Env {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
         self.order
             .iter()
-            .filter_map(|k| self.values.get(k).map(|v| (k.as_str(), v.as_str())))
+            .enumerate()
+            .filter(|(i, k)| {
+                self.index
+                    .as_ref()
+                    .is_none_or(|index| index.get(*k) == Some(i))
+            })
+            .filter_map(|(_, k)| self.values.get(k).map(|v| (k.as_str(), v.as_str())))
     }
 
     /// Whether there are changes not yet saved.
@@ -390,8 +509,13 @@ impl Env {
     ///
     /// The write is atomic (`path_lib::write_atomic`): readers see the old
     /// file or the new one, never a mix. A newly created file is private to
-    /// the owner on Unix (`0600`), since `.env` files often hold secrets;
-    /// an existing file keeps its permissions.
+    /// the owner, since `.env` files often hold secrets: mode `0600` on
+    /// Unix, and on Windows a protected access control list for the current
+    /// user, `SYSTEM`, and `Administrators`, set before anything is written
+    /// (`path_lib::write_atomic_private`). Missing directories are created
+    /// private too. An existing private file stays private; an existing
+    /// file that is not keeps its Unix permissions (on Windows it inherits
+    /// the directory's list).
     ///
     /// # Errors
     ///
@@ -413,12 +537,14 @@ impl Env {
     /// # Errors
     ///
     /// [`Error::Syntax`] if the existing file is malformed (nothing is
-    /// written), [`Error::Path`] if the atomic write fails (for example,
-    /// the directory cannot be created), or [`Error::Io`] if the file cannot
-    /// be read or a new file's permissions cannot be set.
+    /// written), [`Error::Path`] if the existing file fails the check of
+    /// [`open`](Env::open) or the atomic write fails (for example, the
+    /// directory cannot be created), or [`Error::Io`] if the file cannot be
+    /// read.
     pub fn save_to(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = expand(path.as_ref())?;
-        let disk = match read_file(&path)? {
+        self.compact();
+        let disk = match read_file(&path, self.check)? {
             Some(text) => dotenv::parse(&text, Some(&path))?,
             None => Document::default(),
         };
@@ -429,6 +555,7 @@ impl Env {
         } else {
             self.order.iter().chain(&self.changed).collect()
         };
+        let mut dropped: HashSet<&str> = HashSet::new();
         for key in keys {
             match self.values.get(key) {
                 Some(value) => {
@@ -439,26 +566,43 @@ impl Env {
                 }
                 None => {
                     if values.remove(key).is_some() {
-                        order.retain(|k| k != key);
+                        let _new = dropped.insert(key.as_str());
                     }
                 }
             }
         }
+        if !dropped.is_empty() {
+            order.retain(|k| !dropped.contains(k.as_str()));
+        }
         let doc = merge(&disk, &values, &order);
-        create_private(&path)?;
-        path_lib::write_atomic(&path, doc.render())?;
+        // The application's config directory is created, or checked,
+        // through path-lib when this is the application's own file.
+        let app_file = self
+            .app
+            .as_ref()
+            .filter(|app| app.config_at(FILE_NAME).is_ok_and(|own| own == path));
+        if let Some(app) = app_file {
+            let _config = app.ensure(path_lib::Kind::Config)?;
+        }
+        let keep_app = app_file.is_some();
+        write_file(&path, &doc.render())?;
         // Variables that vanished from the file (removed by hand) must also
         // leave the process environment on the next export.
         for key in &self.order {
             if !values.contains_key(key) && !self.removed.contains(key) {
-                self.removed.push(key.clone());
+                let _new = self.removed.insert(key.clone());
             }
         }
         self.values = values;
         self.order = order;
+        self.rebuild_index();
         self.doc = doc;
         self.file = Some(path);
+        if !keep_app {
+            self.app = None;
+        }
         self.changed.clear();
+        self.touched.clear();
         Ok(())
     }
 
@@ -471,11 +615,12 @@ impl Env {
     /// for [`open`](Env::open).
     pub fn reload(&mut self) -> Result<()> {
         let path = self.file.clone().ok_or(Error::NoFile)?;
-        let fresh = Self::open(&path)?.with_prefix(&self.prefix)?;
+        let fresh =
+            Self::open_with(&path, self.check, self.app.clone())?.with_prefix(&self.prefix)?;
         let mut removed = std::mem::take(&mut self.removed);
         for key in &self.order {
             if !fresh.values.contains_key(key) && !removed.contains(key) {
-                removed.push(key.clone());
+                let _new = removed.insert(key.clone());
             }
         }
         *self = fresh;
@@ -501,10 +646,10 @@ impl Env {
     /// ```
     pub fn apply_to<'c>(&self, cmd: &'c mut Command) -> &'c mut Command {
         for (key, value) in self.iter() {
-            let _cmd = cmd.env(self.prefixed(key), value);
+            let _cmd = cmd.env(self.export_name(key).as_ref(), value);
         }
         for key in &self.removed {
-            let _cmd = cmd.env_remove(self.prefixed(key));
+            let _cmd = cmd.env_remove(self.export_name(key).as_ref());
         }
         cmd
     }
@@ -533,11 +678,11 @@ impl Env {
             // access (this function's safety contract); names are
             // validated and values contain no NUL, so `set_var` cannot
             // panic.
-            unsafe { std::env::set_var(self.prefixed(key), value) };
+            unsafe { std::env::set_var(self.export_name(key).as_ref(), value) };
         }
         for key in std::mem::take(&mut self.removed) {
             // SAFETY: as above.
-            unsafe { std::env::remove_var(self.prefixed(&key)) };
+            unsafe { std::env::remove_var(self.export_name(&key).as_ref()) };
         }
     }
 
@@ -550,12 +695,52 @@ impl Env {
         name
     }
 
+    /// Whether prefixed names are recognized: only when the prefix ends
+    /// in the `_` separator, so a prefix such as `APP` never eats the start
+    /// of `APPLE`.
+    fn strips(&self) -> bool {
+        self.prefix.ends_with('_')
+    }
+
     /// Strips the prefix from an already-prefixed name, so `JG_PORT` and
     /// `PORT` address the same variable.
     fn unprefixed<'k>(&self, key: &'k str) -> &'k str {
+        if !self.strips() {
+            return key;
+        }
         match key.strip_prefix(self.prefix.as_str()) {
             Some(rest) if !rest.is_empty() => rest,
             _ => key,
+        }
+    }
+
+    /// The name under which this `Env` stores `key`, if it holds it:
+    /// `key` itself, or its plain form (`PORT` for `JG_PORT`), or its
+    /// prefixed form (`JG_PORT` written in the file, for `PORT`).
+    fn stored_key(&self, key: &str) -> Option<&str> {
+        if let Some((stored, _)) = self.values.get_key_value(key) {
+            return Some(stored);
+        }
+        if !self.strips() {
+            return None;
+        }
+        let plain = self.unprefixed(key);
+        if plain.len() != key.len() {
+            return self.values.get_key_value(plain).map(|(k, _)| k.as_str());
+        }
+        let full = self.prefixed(key);
+        self.values
+            .get_key_value(full.as_str())
+            .map(|(k, _)| k.as_str())
+    }
+
+    /// The name a stored key is exported under: prefixed, unless the file
+    /// already spells it with the prefix.
+    fn export_name<'k>(&self, key: &'k str) -> Cow<'k, str> {
+        if self.strips() && self.unprefixed(key).len() != key.len() {
+            Cow::Borrowed(key)
+        } else {
+            Cow::Owned(self.prefixed(key))
         }
     }
 
@@ -563,11 +748,52 @@ impl Env {
         let (values, order) = values_of(&doc);
         self.values = values;
         self.order = order;
+        self.rebuild_index();
         self.doc = doc;
     }
 
+    /// `order` was replaced by a clean list: every position is live.
+    fn rebuild_index(&mut self) {
+        self.index = None;
+    }
+
+    /// The position index, built from `order` the first time it is needed.
+    fn index_mut(&mut self) -> &mut HashMap<String, usize> {
+        let order = &self.order;
+        self.index.get_or_insert_with(|| {
+            order
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), i))
+                .collect()
+        })
+    }
+
+    /// Drops the removed keys from `order`.
+    fn compact(&mut self) {
+        let Some(index) = self.index.take() else {
+            return;
+        };
+        let live: Vec<String> = std::mem::take(&mut self.order)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, k)| index.get(k) == Some(i))
+            .map(|(_, k)| k)
+            .collect();
+        self.order = live;
+    }
+
+    /// Compacts once removed keys outnumber live ones, so bulk removals
+    /// cost amortized constant time per key.
+    fn compact_if_sparse(&mut self) {
+        let live = self.index.as_ref().map_or(self.order.len(), HashMap::len);
+        if self.order.len() > 2 * live + 32 {
+            self.compact();
+        }
+    }
+
     fn touch(&mut self, key: &str) {
-        if !self.changed.iter().any(|k| k == key) {
+        if self.touched.insert(key.to_owned()) {
             self.changed.push(key.to_owned());
         }
     }
@@ -575,7 +801,8 @@ impl Env {
     /// This `Env` merged into the layout it was loaded from.
     #[cfg(test)]
     fn merged(&self) -> Document {
-        merge(&self.doc, &self.values, &self.order)
+        let order: Vec<String> = self.iter().map(|(k, _)| k.to_owned()).collect();
+        merge(&self.doc, &self.values, &order)
     }
 }
 
@@ -591,7 +818,7 @@ impl fmt::Debug for Env {
         f.debug_struct("Env")
             .field("file", &self.file)
             .field("prefix", &self.prefix)
-            .field("keys", &self.order)
+            .field("keys", &self.iter().map(|(k, _)| k).collect::<Vec<_>>())
             .field("dirty", &self.is_dirty())
             .finish_non_exhaustive()
     }
@@ -620,9 +847,12 @@ fn values_of(doc: &Document) -> (HashMap<String, String>, Vec<String>) {
     let mut values = HashMap::new();
     let mut order = Vec::new();
     for line in &doc.lines {
-        if let Line::Entry { key, value, .. } = line {
-            if values.insert(key.clone(), value.clone()).is_none() {
-                order.push(key.clone());
+        if let Line::Entry(entry) = line {
+            if values
+                .insert(entry.key.clone(), entry.value.clone())
+                .is_none()
+            {
+                order.push(entry.key.clone());
             }
         }
     }
@@ -636,31 +866,25 @@ fn values_of(doc: &Document) -> (HashMap<String, String>, Vec<String>) {
 fn merge(base: &Document, values: &HashMap<String, String>, order: &[String]) -> Document {
     let mut last: HashMap<&str, usize> = HashMap::new();
     for (i, line) in base.lines.iter().enumerate() {
-        if let Line::Entry { key, .. } = line {
-            let _previous = last.insert(key.as_str(), i);
+        if let Line::Entry(entry) = line {
+            let _previous = last.insert(entry.key.as_str(), i);
         }
     }
     let mut lines = Vec::with_capacity(base.lines.len() + values.len());
     for (i, line) in base.lines.iter().enumerate() {
         match line {
             Line::Other(_) => lines.push(line.clone()),
-            Line::Entry {
-                key,
-                value,
-                export,
-                comment,
-                ..
-            } => {
-                let Some(current) = values.get(key) else {
+            Line::Entry(old) => {
+                let Some(current) = values.get(&old.key) else {
                     continue;
                 };
-                if last.get(key.as_str()) != Some(&i) {
+                if last.get(old.key.as_str()) != Some(&i) {
                     continue;
                 }
-                if current == value {
+                if *current == old.value {
                     lines.push(line.clone());
                 } else {
-                    lines.push(entry(key, current, *export, comment));
+                    lines.push(entry(&old.key, current, old.export, &old.comment));
                 }
             }
         }
@@ -681,13 +905,13 @@ fn merge(base: &Document, values: &HashMap<String, String>, order: &[String]) ->
 fn entry(key: &str, value: &str, export: bool, comment: &str) -> Line {
     let mut raw = dotenv::render_entry(key, value, export);
     raw.push_str(comment);
-    Line::Entry {
+    Line::Entry(dotenv::Entry {
         key: key.to_owned(),
         value: value.to_owned(),
         raw,
         export,
         comment: comment.to_owned(),
-    }
+    })
 }
 
 /// Expands a leading `~` when the path is valid Unicode.
@@ -698,17 +922,47 @@ fn expand(path: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Reads a file as UTF-8, or `None` if it does not exist.
-fn read_file(path: &Path) -> Result<Option<String>> {
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::io("open", path, e)),
+/// Reads a file as UTF-8 after `check`, or `None` if it does not exist.
+fn read_file(path: &Path, check: Check) -> Result<Option<String>> {
+    let Some(real) = resolve(path, check)? else {
+        return Ok(None);
     };
-    let len = file
-        .metadata()
-        .map_err(|e| Error::io("inspect", path, e))?
-        .len();
+    let meta = match fs::metadata(&real) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io("inspect", path, e)),
+    };
+    if !meta.is_file() {
+        return Err(Error::io(
+            "open",
+            path,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file (a directory, FIFO, socket, or device)",
+            ),
+        ));
+    }
+    let file = match check {
+        Check::RegularFile => match fs::File::open(&real) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::io("open", path, e)),
+        },
+        Check::Owner(others) => match path_lib::open_checked(&real, others) {
+            Ok(file) => file,
+            Err(path_lib::Error::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(Error::Path(e)),
+        },
+    };
+    let opened = file.metadata().map_err(|e| Error::io("inspect", path, e))?;
+    if !opened.is_file() {
+        return Err(Error::io(
+            "open",
+            path,
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
+        ));
+    }
+    let len = opened.len();
     if len > MAX_FILE_BYTES {
         return Err(Error::TooLarge {
             path: path.to_path_buf(),
@@ -735,31 +989,52 @@ fn read_file(path: &Path) -> Result<Option<String>> {
     })
 }
 
-/// Creates `path` as an empty owner-only file if it does not exist, so the
-/// atomic write that follows preserves those permissions.
-#[cfg(unix)]
-fn create_private(path: &Path) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        path_lib::make_dir(parent)?;
+/// The file `path` names: `path` itself, or the target of a symbolic link
+/// at `path`. A link is followed only when the directory holding it passes
+/// the owner check, so no other account could have planted it. `None`
+/// when nothing is there (a broken link counts as nothing).
+fn resolve(path: &Path, check: Check) -> Result<Option<PathBuf>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io("inspect", path, e)),
+    };
+    if !meta.file_type().is_symlink() {
+        return Ok(Some(path.to_path_buf()));
     }
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(Error::io("create", path, e)),
+    if check != Check::RegularFile {
+        let parent = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(parent) => parent.to_path_buf(),
+            None => std::env::current_dir().map_err(|e| Error::io("inspect", path, e))?,
+        };
+        path_lib::check_owner(&parent, path_lib::Others::MayRead)?;
+    }
+    match fs::canonicalize(path) {
+        Ok(real) => Ok(Some(real)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io("open", path, e)),
     }
 }
 
-/// Windows: files inherit the directory's access control list; the
-/// per-user config directory is already private to the user.
-#[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)] // Same signature as the Unix version.
-fn create_private(_path: &Path) -> Result<()> {
+/// Writes the rendered file atomically. A new file, or one that is already
+/// private, is written private (`0600` on Unix, a protected access control
+/// list on Windows), with missing directories created private too; an
+/// existing file that is not private keeps its Unix permissions.
+fn write_file(path: &Path, text: &str) -> Result<()> {
+    let private = match fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(meta) if meta.is_file() => {
+            let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            path_lib::check_owner_private(real).is_ok()
+        }
+        // A directory or other entry: let the write report it.
+        _ => false,
+    };
+    if private {
+        path_lib::write_atomic_private(path, text)?;
+    } else {
+        path_lib::write_atomic(path, text)?;
+    }
     Ok(())
 }
 

@@ -26,24 +26,32 @@ use std::path::Path;
 use crate::error::{Error, Result};
 use crate::key;
 
-/// One line (or, for multi-line quoted values, one group of lines) of a
-/// `.env` file.
+/// One entry, or one run of comment and blank lines, of a `.env` file.
+///
+/// A run of comment and blank lines is one element, so a file of a
+/// million blank lines costs one `String`, not a million entry-sized
+/// elements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Line {
-    /// A `NAME=value` entry.
-    Entry {
-        key: String,
-        value: String,
-        /// The original text, without line terminators.
-        raw: String,
-        /// Whether the line started with `export `.
-        export: bool,
-        /// An inline comment after the value, with the whitespace before
-        /// it (`"  # note"`), or empty. Kept when the value is rewritten.
-        comment: String,
-    },
-    /// A comment or blank line, verbatim.
+    /// A `NAME=value` entry (one line, or several for a multi-line quoted
+    /// value).
+    Entry(Entry),
+    /// Consecutive comment or blank lines, verbatim, joined with `\n`.
     Other(String),
+}
+
+/// A `NAME=value` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub key: String,
+    pub value: String,
+    /// The original text, without line terminators.
+    pub raw: String,
+    /// Whether the line started with `export `.
+    pub export: bool,
+    /// An inline comment after the value, with the whitespace before it
+    /// (`"  # note"`), or empty. Kept when the value is rewritten.
+    pub comment: String,
 }
 
 /// A parsed `.env` file.
@@ -61,7 +69,7 @@ impl Document {
         let mut out = String::new();
         for line in &self.lines {
             let text = match line {
-                Line::Entry { raw, .. } => raw,
+                Line::Entry(entry) => &entry.raw,
                 Line::Other(text) => text,
             };
             for (i, part) in text.split('\n').enumerate() {
@@ -76,31 +84,57 @@ impl Document {
     }
 }
 
+/// The lines of a text without their terminators (`\n`, and a `\r`
+/// before it), without the empty piece after a final terminator. Lines
+/// are produced one at a time, so parsing never holds a list of them.
+#[derive(Clone)]
+struct RawLines<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Iterator for RawLines<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.rest.is_empty() {
+            return None;
+        }
+        let line = match self.rest.split_once('\n') {
+            Some((line, rest)) => {
+                self.rest = rest;
+                line
+            }
+            None => std::mem::take(&mut self.rest),
+        };
+        Some(line.strip_suffix('\r').unwrap_or(line))
+    }
+}
+
 /// Parses `.env` text. `path` is only used for error messages.
 pub(crate) fn parse(text: &str, path: Option<&Path>) -> Result<Document> {
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     let crlf = text.contains("\r\n");
-    let mut raw_lines: Vec<&str> = text.split('\n').collect();
-    if raw_lines.last() == Some(&"") {
-        let _trailing = raw_lines.pop();
-    }
-    let raw_lines: Vec<&str> = raw_lines
-        .into_iter()
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .collect();
+    let mut lines = RawLines { rest: text };
 
     let mut doc = Document {
         lines: Vec::new(),
         crlf,
     };
-    let mut i = 0;
-    while i < raw_lines.len() {
-        let start = i;
-        let line = raw_lines[i];
+    // 0-based number of the next line `lines` yields.
+    let mut next = 0usize;
+    while let Some(line) = lines.next() {
+        let start = next;
+        next += 1;
         let trimmed = line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            doc.lines.push(Line::Other(line.to_owned()));
-            i += 1;
+            // Fold a run of comment and blank lines into one `Other`.
+            match doc.lines.last_mut() {
+                Some(Line::Other(run)) => {
+                    run.push('\n');
+                    run.push_str(line);
+                }
+                _ => doc.lines.push(Line::Other(line.to_owned())),
+            }
             continue;
         }
         let syntax = |reason| Error::Syntax {
@@ -119,12 +153,21 @@ pub(crate) fn parse(text: &str, path: Option<&Path>) -> Result<Document> {
         key::check_name(name).map_err(|_| syntax("invalid variable name"))?;
         let rest = rest.trim_start_matches([' ', '\t']);
 
-        let (value, consumed) = match rest.chars().next() {
-            Some('"') => quoted(&raw_lines, i, line.len() - rest.len() + 1, '"')
-                .ok_or_else(|| syntax("unterminated double-quoted value"))?,
-            Some('\'') => quoted(&raw_lines, i, line.len() - rest.len() + 1, '\'')
-                .ok_or_else(|| syntax("unterminated single-quoted value"))?,
-            _ => (unquoted(rest), 1),
+        let mut raw = line.to_owned();
+        let value = match rest.chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let (value, extra) =
+                    quoted(&rest[1..], &mut lines, &mut raw, quote).ok_or_else(|| {
+                        syntax(if quote == '"' {
+                            "unterminated double-quoted value"
+                        } else {
+                            "unterminated single-quoted value"
+                        })
+                    })?;
+                next += extra;
+                value
+            }
+            _ => unquoted(rest),
         };
         let comment = match value.after {
             Some(after) => {
@@ -141,15 +184,13 @@ pub(crate) fn parse(text: &str, path: Option<&Path>) -> Result<Document> {
         };
         key::check_value(name, &value.text)
             .map_err(|_| syntax("value contains NUL or is too long"))?;
-        let raw = raw_lines[start..start + consumed].join("\n");
-        doc.lines.push(Line::Entry {
+        doc.lines.push(Line::Entry(Entry {
             key: name.to_owned(),
             value: value.text,
             raw,
             export,
             comment,
-        });
-        i += consumed;
+        }));
     }
     Ok(doc)
 }
@@ -180,18 +221,19 @@ fn unquoted(rest: &str) -> Value<'_> {
     }
 }
 
-/// A quoted value starting at byte `from` of line `first` (just after the
-/// opening quote), possibly spanning following lines. Returns the value and
-/// the number of lines consumed, or `None` if the quote never closes.
+/// A quoted value whose text starts with `segment` (the rest of the line
+/// just after the opening quote), possibly spanning following lines taken
+/// from `lines`, each appended to `raw`. Returns the value and the number
+/// of extra lines consumed, or `None` if the quote never closes.
 fn quoted<'a>(
-    lines: &[&'a str],
-    first: usize,
-    from: usize,
+    segment: &'a str,
+    lines: &mut RawLines<'a>,
+    raw: &mut String,
     quote: char,
 ) -> Option<(Value<'a>, usize)> {
     let mut text = String::new();
-    let mut line_no = first;
-    let mut segment = &lines[first][from..];
+    let mut extra = 0usize;
+    let mut segment = segment;
     loop {
         let mut chars = segment.char_indices();
         while let Some((idx, c)) = chars.next() {
@@ -202,7 +244,7 @@ fn quoted<'a>(
                         text,
                         after: Some(after),
                     },
-                    line_no - first + 1,
+                    extra,
                 ));
             }
             if quote == '"' && c == '\\' {
@@ -221,8 +263,10 @@ fn quoted<'a>(
             }
             text.push(c);
         }
-        line_no += 1;
-        segment = lines.get(line_no)?;
+        segment = lines.next()?;
+        extra += 1;
+        raw.push('\n');
+        raw.push_str(segment);
         text.push('\n');
     }
 }
@@ -277,7 +321,7 @@ mod tests {
             .lines
             .into_iter()
             .filter_map(|l| match l {
-                Line::Entry { key, value, .. } => Some((key, value)),
+                Line::Entry(entry) => Some((entry.key, entry.value)),
                 Line::Other(_) => None,
             })
             .collect()
@@ -331,7 +375,8 @@ mod tests {
     fn test_parse_keeps_comments_blanks_and_raw_text() {
         let text = "# header\n\nA = 1   # keep me\n  # indented\n";
         let doc = parse(text, None).unwrap();
-        assert_eq!(doc.lines.len(), 4);
+        // The header and the blank line are one run of other lines.
+        assert_eq!(doc.lines.len(), 3);
         assert_eq!(doc.render(), text);
     }
 
@@ -394,7 +439,23 @@ mod tests {
     #[test]
     fn test_parse_empty_and_whitespace_only() {
         assert!(parse("", None).unwrap().lines.is_empty());
-        assert_eq!(parse("\n  \n", None).unwrap().lines.len(), 2);
+        let doc = parse("\n  \n", None).unwrap();
+        assert_eq!(doc.lines.len(), 1);
+        assert_eq!(doc.render(), "\n  \n");
+    }
+
+    #[test]
+    fn test_runs_of_other_lines_cost_one_line_each() {
+        // A file of nothing but blank lines is one `Other`, not one
+        // entry-sized element per line.
+        let blank = "\n".repeat(1024 * 1024 - 1);
+        let doc = parse(&blank, None).unwrap();
+        assert_eq!(doc.lines.len(), 1);
+        assert_eq!(doc.render(), blank);
+        let mixed = "# a\n\nA=1\n# b\n# c\nB=2\n\n";
+        let doc = parse(mixed, None).unwrap();
+        assert_eq!(doc.lines.len(), 5);
+        assert_eq!(doc.render(), mixed);
     }
 
     #[test]
@@ -435,7 +496,7 @@ mod comment_tests {
 
     fn comment_of(text: &str) -> String {
         match parse(text, None).unwrap().lines.into_iter().next() {
-            Some(Line::Entry { comment, .. }) => comment,
+            Some(Line::Entry(entry)) => entry.comment,
             other => panic!("{other:?}"),
         }
     }

@@ -11,6 +11,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.0] - 2026-11-12
+
+Security release. Requires `path-lib` 1.3.
+
+### Security
+
+- **Machine-wide `.env` files on Windows are private.** A `.env` saved by
+  `Env::for_app` on an `App::global` landed in
+  `%ProgramData%\<app>\config` with the inherited list, which lets every
+  local user read it and create files next to it. A new file is now
+  written private from the first byte (a protected list for the current
+  user, `SYSTEM`, and `Administrators`, through
+  `path_lib::write_atomic_private`), and the config directory is created
+  through `App::ensure`, which gives a global directory read but no write
+  access for `Users` and checks an existing one. On load, a global
+  application's file must also be unreadable by other accounts.
+- **Files are checked before they are read.** `open`, `for_app`,
+  `reload`, and `save` loaded any file: one other accounts could write,
+  one another account owned, or a FIFO, which hung the program. Every read
+  now opens the file with `path_lib::open_checked` and refuses, with the
+  reason, a file that is owned by an untrusted account or that other
+  accounts can change (group or other write on Unix, a write right for
+  another account on Windows). Anything but a regular file fails with
+  `Error::Io`; on Unix the file is opened without blocking. A symbolic
+  link is followed only from a directory that passes the same check.
+- **New secrets files are never readable by others while being written
+  (Unix).** The bytes used to sit in a default-mode staging file before
+  being narrowed to `0600`. The save now uses `path-lib` 1.3, whose
+  staging file is `0600` from the start, and missing directories are
+  created `0700`.
+
+### Added
+
+- `Env::open_unchecked(path)`: `open` without the owner and permission
+  check (it still requires a regular file), for development setups such
+  as a project `.env` in a checkout other accounts can write.
+
+### Fixed
+
+- **A prefix without a trailing `_` no longer renames names.** With
+  `with_prefix("APP")`, `set("APPLE", ..)` stored `LE`. A prefix is now
+  stripped from names only when it ends in `_`.
+- **Names written with the prefix in the file are reachable.**
+  `JG_TOKEN=abc` in the file could not be read, changed, or removed
+  through `JG_TOKEN` or `TOKEN`, and was exported as `JG_JG_TOKEN`. It is
+  now the same variable under both names, and is exported once, as
+  `JG_TOKEN`.
+- **Parsing memory is bounded by the file.** A run of comment and blank
+  lines is now one element, and lines are read one at a time instead of
+  being collected first: a 1 MiB file of blank lines took about 172 MiB to
+  parse and now takes about 1 MiB. A file at the limit made only of very
+  short entries still takes about 37 MiB; `MAX_FILE_BYTES` documents it.
+- **Bulk changes are linear.** `clear`, setting or removing many
+  variables, `save`, and `reload` did a linear scan per variable, so
+  `clear()` on 40,000 variables took 1.8 s. They now take time
+  proportional to the number of variables (40,000: about 40 ms).
+
+### Documentation
+
+- Values are held in ordinary `String`s, are not wiped from memory when
+  dropped, and are copied by `Clone`.
+- The quick start and `with_prefix` recommend a prefix of your own, since
+  every program on the default shares the `JG_` namespace.
+- `MAX_VALUE_BYTES` no longer claims every value of that size can be
+  exported on Windows.
+
+### Upgrading
+
+A `.env` that other accounts can change is now refused. On Windows that
+includes files under a directory that inherits write access for
+`Authenticated Users` or `Users`, such as a checkout directly under `C:\`
+or another drive's root, and files an earlier version saved for a global
+application under `%ProgramData%`. Remove that access (or delete the file
+and save it again), or use `Env::open_unchecked` for a development
+checkout.
+
+---
+
 ## [1.0.1] - 2026-10-26
 
 ### Fixed
@@ -77,6 +155,7 @@ Initial stable release. The public API is frozen for 1.x under
 - Unit, integration, and property tests; criterion benchmarks; CI for
   Linux, macOS, and Windows on stable and MSRV 1.85.
 
-[Unreleased]: https://github.com/jamesgober/env-lib/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/jamesgober/env-lib/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/env-lib/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/jamesgober/env-lib/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/env-lib/releases/tag/v1.0.0
