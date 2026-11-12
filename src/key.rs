@@ -129,8 +129,8 @@ mod tests {
     #[test]
     fn test_normalize_prefix_defaults_and_validates() {
         assert_eq!(normalize_prefix("").unwrap(), DEFAULT_PREFIX);
-        assert_eq!(normalize_prefix("HIVE_").unwrap(), "HIVE_");
-        assert_eq!(normalize_prefix("hive").unwrap(), "hive");
+        assert_eq!(normalize_prefix("MYAPP_").unwrap(), "MYAPP_");
+        assert_eq!(normalize_prefix("myapp").unwrap(), "myapp");
         for bad in ["JG.", "1_", "A-", " "] {
             assert!(
                 matches!(normalize_prefix(bad), Err(Error::InvalidPrefix { .. })),

@@ -46,7 +46,7 @@
 //! in a process environment carry the prefix (`JG_PORT` by default; change
 //! it with [`Env::with_prefix`], and an empty prefix falls back to `JG_`).
 //! Every program that keeps the default shares the `JG_` namespace, so a
-//! program should set a prefix of its own (`HIVE_`), ending in `_`. A name
+//! program should set a prefix of its own (`MYAPP_`), ending in `_`. A name
 //! written with the prefix in the file (`JG_TOKEN=...`) is the same
 //! variable as the plain one.
 //! [`Env::get`] looks in the `Env` first and then in the process

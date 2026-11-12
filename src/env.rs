@@ -198,7 +198,7 @@ impl Env {
 
     /// Opens the `.env` file in an application's config directory, as
     /// resolved by `path-lib` (for example
-    /// `~/.config/HiveDB/.env` on Linux).
+    /// `~/.config/MyApp/.env` on Linux).
     ///
     /// The file is checked as by [`open`](Env::open). For an application
     /// in [`Scope::Global`](path_lib::Scope::Global), a machine-wide
@@ -219,7 +219,7 @@ impl Env {
     /// # Examples
     ///
     /// ```no_run
-    /// let app = path_lib::App::new("HiveDB")?;
+    /// let app = path_lib::App::new("MyApp")?;
     /// let env = env_lib::Env::for_app(&app)?;
     /// # Ok::<(), env_lib::Error>(())
     /// ```
@@ -260,10 +260,10 @@ impl Env {
     /// (`JG_`). Programs that are not part of one family of tools should
     /// set their own, so they do not read each other's `JG_` variables.
     ///
-    /// End the prefix with `_` (`HIVE_`). Only then is a prefixed name
-    /// (`HIVE_PORT`) treated as the same variable as the plain one
-    /// (`PORT`). A prefix without the separator (`HIVE`) is still added
-    /// on export (`HIVEPORT`), but names are never stripped of it, so
+    /// End the prefix with `_` (`MYAPP_`). Only then is a prefixed name
+    /// (`MYAPP_PORT`) treated as the same variable as the plain one
+    /// (`PORT`). A prefix without the separator (`MYAPP`) is still added
+    /// on export (`MYAPPPORT`), but names are never stripped of it, so
     /// `APPLE` stays `APPLE` under the prefix `APP`.
     ///
     /// # Errors
@@ -274,8 +274,8 @@ impl Env {
     /// # Examples
     ///
     /// ```
-    /// let env = env_lib::Env::new().with_prefix("HIVE_")?;
-    /// assert_eq!(env.prefix(), "HIVE_");
+    /// let env = env_lib::Env::new().with_prefix("MYAPP_")?;
+    /// assert_eq!(env.prefix(), "MYAPP_");
     /// assert_eq!(env_lib::Env::new().with_prefix("")?.prefix(), "JG_");
     /// # Ok::<(), env_lib::Error>(())
     /// ```
