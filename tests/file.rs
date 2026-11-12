@@ -8,19 +8,26 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use env_lib::{Env, Error};
 
-struct Sandbox(PathBuf);
+/// A scratch directory private to the current user (files are refused
+/// when other accounts can change them, so the tests must not depend on
+/// the access control list of the machine's temp directory).
+struct Sandbox(PathBuf, PathBuf);
 
 impl Sandbox {
     fn new(label: &str) -> Self {
         static N: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join("env-lib-tests").join(format!(
+        let root = std::env::temp_dir().join("env-lib-tests").join(format!(
             "{label}-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        let _ = fs::remove_dir_all(&root);
+        let app = path_lib::App::portable("sandbox", &root).unwrap();
+        let dir = app
+            .ensure_private(path_lib::Kind::Data)
+            .unwrap()
+            .to_path_buf();
+        Self(dir, root)
     }
 
     fn file(&self) -> PathBuf {
@@ -30,7 +37,7 @@ impl Sandbox {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.1);
     }
 }
 

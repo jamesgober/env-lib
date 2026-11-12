@@ -15,8 +15,10 @@ pub const DEFAULT_PREFIX: &str = "JG_";
 pub const MAX_KEY_BYTES: usize = 255;
 
 /// Longest accepted value, in bytes. Windows caps an environment variable
-/// at 32,767 UTF-16 units; staying within that in bytes keeps every value
-/// exportable on every platform.
+/// at 32,767 UTF-16 units, and some of its APIs apply that limit to the
+/// whole `NAME=value` string, so a value this long may still be refused by
+/// the system on export once the prefixed name is added. Keep values that
+/// must be exported on Windows well below it.
 pub const MAX_VALUE_BYTES: usize = 32_767;
 
 /// Validates a name against the portable rules. Returns the reason on
