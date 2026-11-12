@@ -79,7 +79,7 @@ assert_eq!(opened.file(), Some(file.as_path()));
 `Env::for_app` opens `FILE_NAME` (`.env`) in the config directory of a [`path_lib::App`](https://docs.rs/path-lib): `~/.config/<app>/.env` on Linux, `~/Library/Preferences/<app>/.env` on macOS, and `%APPDATA%\<app>\.env` on Windows for user scope. A global or portable `App` gives the matching directory for that scope.
 
 ```rust
-let app = path_lib::App::new("HiveDB")?;
+let app = path_lib::App::new("MyApp")?;
 let env = env_lib::Env::for_app(&app)?;
 # Ok::<(), env_lib::Error>(())
 ```
@@ -102,8 +102,8 @@ env.set("JG_PORT", "7000")?;                           // same variable as PORT
 assert_eq!(env.get("PORT").as_deref(), Some("7000"));
 assert_eq!(env.iter().collect::<Vec<_>>(), [("PORT", "7000")]);
 
-let env = env.with_prefix("HIVE_")?;
-assert_eq!(env.prefix(), "HIVE_");
+let env = env.with_prefix("MYAPP_")?;
+assert_eq!(env.prefix(), "MYAPP_");
 assert_eq!(env_lib::Env::new().with_prefix("")?.prefix(), "JG_");
 assert!(env_lib::Env::new().with_prefix("JG.").is_err());
 # Ok::<(), env_lib::Error>(())
@@ -114,9 +114,9 @@ assert!(env_lib::Env::new().with_prefix("JG.").is_err());
 | `with_prefix(self, prefix)` | Sets the prefix; returns the `Env` for chaining |
 | `prefix()` | The current prefix, `JG_` unless changed |
 
-The default prefix is `DEFAULT_PREFIX`, `"JG_"`. An empty prefix means the default. Any other prefix must itself be a valid name, or `with_prefix` fails with `Error::InvalidPrefix`; `JG.` is rejected because a dot cannot appear in a shell variable name. The prefix is joined to the name as written, so include the separator: `HIVE_` gives `HIVE_PORT`, while `HIVE` gives `HIVEPORT`. Every program that keeps the default shares the `JG_` namespace with every other one, so set a prefix of your own.
+The default prefix is `DEFAULT_PREFIX`, `"JG_"`. An empty prefix means the default. Any other prefix must itself be a valid name, or `with_prefix` fails with `Error::InvalidPrefix`; `JG.` is rejected because a dot cannot appear in a shell variable name. The prefix is joined to the name as written, so include the separator: `MYAPP_` gives `MYAPP_PORT`, while `MYAPP` gives `MYAPPPORT`. Every program that keeps the default shares the `JG_` namespace with every other one, so set a prefix of your own.
 
-With a prefix that ends in `_`, every method that takes a name accepts it with or without the prefix: with the prefix `JG_`, both `PORT` and `JG_PORT` address the variable `PORT`. A name equal to the prefix alone (`JG_`) is a name of its own. Since 1.1 this also holds for names written with the prefix in the file: `JG_TOKEN=abc` is found by `get("JG_TOKEN")` and by `get("TOKEN")`, and is exported once, as `JG_TOKEN`. A prefix without the trailing `_` (`HIVE`) is still added on export, but names are never stripped of it, so with the prefix `APP` the name `APPLE` stays `APPLE` (before 1.1 it became `LE`).
+With a prefix that ends in `_`, every method that takes a name accepts it with or without the prefix: with the prefix `JG_`, both `PORT` and `JG_PORT` address the variable `PORT`. A name equal to the prefix alone (`JG_`) is a name of its own. Since 1.1 this also holds for names written with the prefix in the file: `JG_TOKEN=abc` is found by `get("JG_TOKEN")` and by `get("TOKEN")`, and is exported once, as `JG_TOKEN`. A prefix without the trailing `_` (`MYAPP`) is still added on export, but names are never stripped of it, so with the prefix `APP` the name `APPLE` stays `APPLE` (before 1.1 it became `LE`).
 
 ### Reading
 
@@ -251,7 +251,7 @@ use std::process::Command;
 let mut env = env_lib::Env::from_text("PORT=7000\nOLD=1\n")?;
 env.remove("OLD");
 
-let mut cmd = Command::new("hive-worker");
+let mut cmd = Command::new("myapp-worker");
 env.apply_to(&mut cmd).arg("--serve");                 // returns &mut Command
 let vars: Vec<_> = cmd.get_envs().collect();
 assert!(vars.contains(&("JG_PORT".as_ref(), Some("7000".as_ref()))));
@@ -265,7 +265,7 @@ assert!(vars.contains(&("JG_OLD".as_ref(), None)));    // removed in the child
 
 ```rust,no_run
 fn main() -> Result<(), env_lib::Error> {
-    let app = path_lib::App::new("HiveDB")?;
+    let app = path_lib::App::new("MyApp")?;
     let mut env = env_lib::Env::for_app(&app)?;
 
     // SAFETY: the first thing main does; no other thread exists yet.
@@ -412,7 +412,7 @@ New and changed entries are written unquoted when the value contains only ASCII 
 
 ```text
 PORT=7000
-DB_URL=postgres://localhost/hive
+DB_URL=postgres://localhost/myapp
 GREETING="hello, world"
 PRICE="\$5"
 MOTD="line one\nline two"

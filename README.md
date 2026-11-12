@@ -56,7 +56,7 @@
 ### Handing Variables to Other Code
 - **`apply_to(&mut Command)`** &mdash; sets the prefixed variables on a child process; safe
 - **`export()`** &mdash; writes them into the current process environment for code that reads `std::env` directly; `unsafe`, for use at startup
-- **`with_prefix("HIVE_")`** &mdash; one namespace prefix for every exported variable; `JG_` by default
+- **`with_prefix("MYAPP_")`** &mdash; one namespace prefix for every exported variable; `JG_` by default
 
 ### Secrets
 - **Never printed** &mdash; `Debug` lists names only; errors name the variable, file, and line, never the value
@@ -82,18 +82,18 @@ env-lib = "1.1"
 ```rust
 use env_lib::Env;
 
-// The file is ~/.config/HiveDB/.env on Linux, %APPDATA%\HiveDB\.env on Windows.
-let app = path_lib::App::new("HiveDB")?;
+// The file is ~/.config/MyApp/.env on Linux, %APPDATA%\MyApp\.env on Windows.
+let app = path_lib::App::new("MyApp")?;
 let mut env = Env::for_app(&app)?             // a missing file is an empty Env
-    .with_prefix("HIVE_")?;                   // exported as HIVE_PORT, not the shared JG_PORT
+    .with_prefix("MYAPP_")?;                   // exported as MYAPP_PORT, not the shared JG_PORT
 
 env.set("PORT", "7000")?;
-env.set("DB_URL", "postgres://localhost/hive")?;
+env.set("DB_URL", "postgres://localhost/myapp")?;
 env.remove("LEGACY_MODE");
 env.save()?;                                  // comments and hand edits are kept
 
 // Next run, or after someone edits the file by hand:
-let env = Env::for_app(&app)?.with_prefix("HIVE_")?;
+let env = Env::for_app(&app)?.with_prefix("MYAPP_")?;
 let port: u16 = env.parse("PORT")?.unwrap_or(8080);
 let debug = env.flag("DEBUG")?.unwrap_or(false);
 let level = env.get_or("LOG_LEVEL", "info");
@@ -103,9 +103,9 @@ let level = env.get_or("LOG_LEVEL", "info");
 ### The File
 
 ```text
-# HiveDB settings
+# MyApp settings
 PORT=7000
-DB_URL=postgres://localhost/hive
+DB_URL=postgres://localhost/myapp
 
 # added by hand; kept exactly as written on every save
 export LOG_LEVEL = debug   # temporary
@@ -117,11 +117,11 @@ GREETING="Hello,\nworld"
 ```rust
 use std::process::Command;
 
-let mut env = env_lib::Env::from_text("PORT=7000\n")?.with_prefix("HIVE_")?;
+let mut env = env_lib::Env::from_text("PORT=7000\n")?.with_prefix("MYAPP_")?;
 env.set("WORKERS", "8")?;
 
-let mut cmd = Command::new("hive-worker");
-env.apply_to(&mut cmd);                       // HIVE_PORT=7000, HIVE_WORKERS=8
+let mut cmd = Command::new("myapp-worker");
+env.apply_to(&mut cmd);                       // MYAPP_PORT=7000, MYAPP_WORKERS=8
 # Ok::<(), env_lib::Error>(())
 ```
 

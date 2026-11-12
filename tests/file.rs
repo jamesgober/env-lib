@@ -48,14 +48,14 @@ fn test_session_changes_persist_to_next_session() {
     let mut env = Env::open(sb.file()).unwrap();
     assert!(env.is_empty());
     env.set("PORT", "7000").unwrap();
-    env.set("NAME", "hive db").unwrap();
+    env.set("NAME", "my app").unwrap();
     env.set("OLD", "x").unwrap();
     env.save().unwrap();
     assert!(!env.is_dirty());
 
     // Session 2: edit, delete, add.
     let mut env = Env::open(sb.file()).unwrap();
-    assert_eq!(env.get("NAME").as_deref(), Some("hive db"));
+    assert_eq!(env.get("NAME").as_deref(), Some("my app"));
     env.set("PORT", "7001").unwrap();
     assert!(env.remove("OLD"));
     env.set("NEW", "y").unwrap();
@@ -65,7 +65,7 @@ fn test_session_changes_persist_to_next_session() {
     let env = Env::open(sb.file()).unwrap();
     assert_eq!(
         env.iter().collect::<Vec<_>>(),
-        [("PORT", "7001"), ("NAME", "hive db"), ("NEW", "y")]
+        [("PORT", "7001"), ("NAME", "my app"), ("NEW", "y")]
     );
 }
 
